@@ -1,0 +1,23 @@
+[Unit]
+Description=FlowCheck API Service
+After=network.target postgresql.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=geoskimoto
+WorkingDirectory=/home/geoskimoto/projects/flowcheck-api
+EnvironmentFile=/home/geoskimoto/projects/flowcheck-api/.env
+ExecStart=/home/geoskimoto/projects/flowcheck-api/venv/bin/uvicorn \
+    app.main:app \
+    --host 127.0.0.1 \
+    --port 8098 \
+    --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flowcheck-api
+
+[Install]
+WantedBy=multi-user.target
