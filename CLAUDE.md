@@ -6,7 +6,7 @@ adds JWT auth, user favorites, alert subscriptions, and sends FCM push notificat
 flow at a subscribed station reaches the 95th percentile.
 
 ## Port & Deploy
-- Port **8052** (8050=dashboard, 8051=percent-runoff, 8001=resid-cast)
+- Port **8098** (8050=dashboard, 8051=percent-runoff, 8001=resid-cast)
 - Systemd service: `sudo systemctl restart flowcheck-api`
 - Unit file: `/home/geoskimoto/projects/flowcheck-api/flowcheck-api.service`
 - Nginx config: `/home/geoskimoto/projects/flowcheck-api/flowcheck-api.3rdplaces.io.conf`
