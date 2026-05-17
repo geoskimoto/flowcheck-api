@@ -11,8 +11,13 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Override sqlalchemy.url from environment so we don't store credentials in alembic.ini
+# Resolve sqlalchemy.url so we don't store credentials in alembic.ini.
+# An explicit DATABASE_URL env var wins (CI / test DB); otherwise fall back to
+# the app settings, which load DATABASE_URL from the project's .env file.
 database_url = os.environ.get("DATABASE_URL")
+if not database_url:
+    from app.config import get_settings
+    database_url = get_settings().database_url
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 
