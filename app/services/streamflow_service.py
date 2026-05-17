@@ -12,7 +12,13 @@ BAND_LABELS = {
     "p11_25": "Below Normal",
     "p26_50": "Normal",
     "p51_75": "Above Normal",
+    # StreamflowOps splits the high end finer than the original p76_100 bucket.
     "p76_100": "High",
+    "p76_85": "High",
+    "p86_90": "High",
+    "p91_95": "Very High",
+    "p96_98": "Very High",
+    "p99_100": "Extremely High",
 }
 
 PNW_STATES = ["WA", "OR", "ID"]
@@ -52,7 +58,7 @@ class StreamflowService:
                 r["station_number"]: {
                     "band": r.get("band", ""),
                     "percentile_rank": r.get("percentile_rank", 0.0),
-                    "current_discharge": r.get("current_discharge", 0.0),
+                    "current_discharge": r.get("discharge", 0.0),
                 }
                 for r in resp.get("results", [])
             }
@@ -86,7 +92,12 @@ class StreamflowService:
             for state in PNW_STATES:
                 page = self._client.get_stations(state=state, agency="USGS", limit=10000)
                 for station in page.results:
-                    all_stations.append(self._station_to_dict(station))
+                    d = self._station_to_dict(station)
+                    # StreamflowOps does not echo a state field per record; stamp it
+                    # from the known per-state query so list_stations() can filter.
+                    if not d.get("state"):
+                        d["state"] = state
+                    all_stations.append(d)
             self._station_cache = all_stations
             self._station_cache_time = time.time()
         except Exception as e:
@@ -101,10 +112,10 @@ class StreamflowService:
             "name": station.name,
             "latitude": station.latitude,
             "longitude": station.longitude,
-            "state": station.state,
+            "state": station.state_code,
             "is_active": station.is_active,
             "huc_code": getattr(station, "huc_code", None),
-            "basin": getattr(station, "basin", None),
+            "basin": getattr(station, "basin_name", None),
             "years_of_record": getattr(station, "years_of_record", None),
             "record_start_date": str(getattr(station, "record_start_date", None) or ""),
         }

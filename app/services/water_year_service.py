@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -136,13 +136,26 @@ def _fetch_and_compute(station_number: str, current_wy: int) -> list[dict]:
             api_token=settings.dataops_api_token,
             timeout=settings.dataops_timeout,
         )
-        observations = client.get_station_data(station_number, data_type="daily_mean")
+        # get_station_data requires an explicit date range. Water-year percentiles
+        # need the full historical record, so request a wide window.
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=365 * 40)
+        observations = client.get_station_data(
+            station_number,
+            start_date=start_date,
+            end_date=end_date,
+            data_type="daily_mean",
+        )
         if not observations:
             return []
 
         rows = []
         for obs in observations:
-            rows.append({"date": obs.date if hasattr(obs, "date") else obs.get("date"), "discharge": obs.discharge if hasattr(obs, "discharge") else obs.get("discharge")})
+            # DischargeObservation exposes observed_at (tz-aware) + discharge_value.
+            observed_at = obs.observed_at
+            if observed_at is not None and observed_at.tzinfo is not None:
+                observed_at = observed_at.replace(tzinfo=None)
+            rows.append({"date": observed_at, "discharge": obs.discharge_value})
 
         df = pd.DataFrame(rows)
         if df.empty:
