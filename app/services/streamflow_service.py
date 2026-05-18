@@ -84,9 +84,19 @@ class StreamflowService:
         return [self._enrich(s, percentiles) for s in stations]
 
     def get_station(self, station_number: str) -> Optional[dict]:
+        # Serve detail from the station cache (it already holds full per-
+        # station fields). A live upstream call per detail open made the
+        # endpoint slow/unreliable — StreamflowOps intermittently resets,
+        # so most detail loads were 404ing after ~10s. Only fall back to a
+        # live lookup for stations not in the cached region.
+        if self._stations_stale():
+            self._refresh_station_cache()
+        percentiles = self._fetch_percentiles()
+        for s in self._station_cache:
+            if s.get("station_number") == station_number:
+                return self._enrich(s, percentiles, detail=True)
         try:
             raw = self._client.get_station(station_number)
-            percentiles = self._fetch_percentiles()
             station_dict = self._station_to_dict(raw)
             return self._enrich(station_dict, percentiles, detail=True)
         except Exception as e:
