@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 WY_START_MONTH = 10
 
 
+class WaterYearDataUnavailable(Exception):
+    """Transient upstream failure — caller should retry, must NOT be cached."""
+
+
 def _current_water_year() -> int:
     now = datetime.now()
     return now.year + 1 if now.month >= WY_START_MONTH else now.year
@@ -101,11 +105,14 @@ def compute_water_year_stats(
     return stats.to_dict(orient="records")
 
 
-def get_water_year_stats(station_number: str, db: Session) -> Optional[list[dict]]:
+def get_water_year_stats(station_number: str, db: Session) -> list[dict]:
     """
-    Return cached water year stats for a station, computing if cache is stale or missing.
-    Cache is valid for the entire current water year (invalidates Oct 1).
-    Returns None if computation fails (insufficient data or API error).
+    Return cached water year stats, computing on cache miss.
+
+    Returns a list of per-day-of-WY stat dicts, or [] when the station has
+    no/insufficient historical daily record (a definitive, cacheable fact
+    for this water year). Raises WaterYearDataUnavailable on a transient
+    upstream failure (not cached — safe to retry).
     """
     current_wy = _current_water_year()
 
@@ -114,59 +121,100 @@ def get_water_year_stats(station_number: str, db: Session) -> Optional[list[dict
         WaterYearStatsCache.water_year == current_wy,
     ).first()
 
-    if cached:
+    if cached is not None:
+        # stats_json may legitimately be [] (cached "insufficient history").
         logger.debug(f"Water year stats cache HIT: {station_number} WY{current_wy}")
-        return cached.stats_json
+        return cached.stats_json or []
 
     logger.info(f"Water year stats cache MISS: computing {station_number} WY{current_wy}")
+    # _fetch_and_compute raises WaterYearDataUnavailable on transient failure;
+    # that propagates (uncached). A definitive [] IS cached so a no-data
+    # station isn't re-fetched (30yr) on every view.
     stats = _fetch_and_compute(station_number, current_wy)
-    if not stats:
-        return None
-
     _upsert_cache(db, station_number, current_wy, stats)
     return stats
 
 
-def _fetch_and_compute(station_number: str, current_wy: int) -> list[dict]:
+def get_current_water_year_series(station_number: str) -> list[dict]:
+    """
+    Current (in-progress) water year's observed daily discharge as
+    [{day_of_wy, discharge}], sorted by day_of_wy. Small Oct1->today fetch.
+    Raises WaterYearDataUnavailable on transient upstream failure.
+    """
+    current_wy = _current_water_year()
+    wy_start = datetime(current_wy - 1, WY_START_MONTH, 1)
+    end_date = datetime.now()
+
+    observations = _get_station_data_with_retry(station_number, wy_start, end_date)
+    out: list[dict] = []
+    for obs in observations or []:
+        observed_at = obs.observed_at
+        if observed_at is None or obs.discharge_value is None:
+            continue
+        if observed_at.tzinfo is not None:
+            observed_at = observed_at.replace(tzinfo=None)
+        out.append({
+            "day_of_wy": _get_day_of_water_year(pd.Timestamp(observed_at)),
+            "discharge": obs.discharge_value,
+        })
+    out.sort(key=lambda r: r["day_of_wy"])
+    return out
+
+
+def _get_station_data_with_retry(station_number, start_date, end_date):
+    """
+    Fetch daily-mean observations, retrying through StreamflowOps' frequent
+    connection resets. Raises WaterYearDataUnavailable if all attempts fail.
+    """
     settings = get_settings()
-    try:
-        from dataops_client.client import DataOpsClient
-        client = DataOpsClient(
-            base_url=settings.dataops_api_url,
-            api_token=settings.dataops_api_token,
-            timeout=settings.dataops_timeout,
-        )
-        # get_station_data requires an explicit date range. Water-year percentiles
-        # need the full historical record, so request a wide window.
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=365 * 40)
-        observations = client.get_station_data(
-            station_number,
-            start_date=start_date,
-            end_date=end_date,
-            data_type="daily_mean",
-        )
-        if not observations:
-            return []
+    from dataops_client.client import DataOpsClient
+    client = DataOpsClient(
+        base_url=settings.dataops_api_url,
+        api_token=settings.dataops_api_token,
+        timeout=settings.dataops_timeout,
+    )
+    last_err = None
+    for _ in range(3):
+        try:
+            return client.get_station_data(
+                station_number,
+                start_date=start_date,
+                end_date=end_date,
+                data_type="daily_mean",
+            )
+        except Exception as e:  # noqa: BLE001 — retry any transient
+            last_err = e
+    logger.warning(f"Station data fetch failed for {station_number}: {last_err}")
+    raise WaterYearDataUnavailable(str(last_err))
 
-        rows = []
-        for obs in observations:
-            # DischargeObservation exposes observed_at (tz-aware) + discharge_value.
-            observed_at = obs.observed_at
-            if observed_at is not None and observed_at.tzinfo is not None:
-                observed_at = observed_at.replace(tzinfo=None)
-            rows.append({"date": observed_at, "discharge": obs.discharge_value})
 
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return []
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.set_index("date").rename(columns={"discharge": "discharge_cfs"})
+def _fetch_and_compute(station_number: str, current_wy: int) -> list[dict]:
+    # 30yr window (was 40): the larger the window the longer/more reset-prone
+    # the cold fetch; 30yr is ample for stable per-day-of-WY percentiles.
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365 * 30)
 
-        return compute_water_year_stats(station_number, df, current_water_year=current_wy)
-    except Exception as e:
-        logger.error(f"Failed to fetch/compute water year stats for {station_number}: {e}")
+    # Raises WaterYearDataUnavailable on transient failure (propagates,
+    # uncached). A successful-but-empty response is a definitive "no data".
+    observations = _get_station_data_with_retry(station_number, start_date, end_date)
+    if not observations:
         return []
+
+    rows = []
+    for obs in observations:
+        # DischargeObservation exposes observed_at (tz-aware) + discharge_value.
+        observed_at = obs.observed_at
+        if observed_at is not None and observed_at.tzinfo is not None:
+            observed_at = observed_at.replace(tzinfo=None)
+        rows.append({"date": observed_at, "discharge": obs.discharge_value})
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return []
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.set_index("date").rename(columns={"discharge": "discharge_cfs"})
+
+    return compute_water_year_stats(station_number, df, current_water_year=current_wy)
 
 
 def _upsert_cache(db: Session, station_number: str, water_year: int, stats: list[dict]):
