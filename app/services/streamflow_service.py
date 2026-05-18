@@ -1,5 +1,6 @@
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.config import get_settings
@@ -21,7 +22,13 @@ BAND_LABELS = {
     "p99_100": "Extremely High",
 }
 
-PNW_STATES = ["WA", "OR", "ID"]
+# Mirrors the USGS dashboard's TARGET_STATES (Western US). BC is intentionally
+# omitted: it requires agency=EC (Environment Canada), which is a separate
+# multi-agency effort tracked as a follow-up.
+TARGET_STATES = ["OR", "WA", "ID", "MT", "NV", "CA", "UT", "AZ", "CO"]
+
+# StreamflowOps caps stations responses at 1000 rows/page regardless of `limit`.
+_STATION_PAGE_SIZE = 1000
 
 
 def band_to_label(band: str) -> str:
@@ -87,21 +94,55 @@ class StreamflowService:
             return None
 
     def _refresh_station_cache(self):
-        try:
-            all_stations = []
-            for state in PNW_STATES:
-                page = self._client.get_stations(state=state, agency="USGS", limit=10000)
-                for station in page.results:
-                    d = self._station_to_dict(station)
-                    # StreamflowOps does not echo a state field per record; stamp it
-                    # from the known per-state query so list_stations() can filter.
-                    if not d.get("state"):
-                        d["state"] = state
-                    all_stations.append(d)
+        # NOTE: the StreamflowOps /stations/ endpoint ignores the `offset`
+        # query param (offset=0 and offset=1000 return the identical first
+        # 1000 rows), so there is no usable pagination — 1000 stations/state
+        # is a hard ceiling via this API. Full coverage would require direct
+        # DB access (as the dashboard uses), which is out of scope here.
+        # Each state is fetched independently so a transient failure on one
+        # state cannot wipe coverage for the others.
+        def fetch_state(state: str) -> list[dict]:
+            # StreamflowOps connections reset intermittently; retry so a big
+            # state (e.g. WA) isn't silently dropped from coverage.
+            last_err = None
+            for attempt in range(3):
+                try:
+                    page = self._client.get_stations(
+                        state=state, agency="USGS",
+                        limit=_STATION_PAGE_SIZE,
+                    )
+                    rows = []
+                    for station in page.results:
+                        d = self._station_to_dict(station)
+                        # StreamflowOps does not echo a state field per
+                        # record; stamp it from the known per-state query
+                        # so list_stations() can filter.
+                        if not d.get("state"):
+                            d["state"] = state
+                        rows.append(d)
+                    return rows
+                except Exception as e:  # noqa: BLE001 — retry any transient
+                    last_err = e
+            logger.warning(f"Station fetch failed for {state}: {last_err}")
+            return []
+
+        # States are independent fetches — run them concurrently to keep the
+        # cold-cache refresh fast (sequential was ~35s for 9 states).
+        all_stations: list[dict] = []
+        any_success = False
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            for rows in pool.map(fetch_state, TARGET_STATES):
+                if rows:
+                    any_success = True
+                    all_stations.extend(rows)
+
+        # Only replace the cache if at least one state succeeded, so a total
+        # outage doesn't blow away a previously good cache.
+        if any_success:
             self._station_cache = all_stations
             self._station_cache_time = time.time()
-        except Exception as e:
-            logger.error(f"Station cache refresh failed: {e}")
+        else:
+            logger.error("Station cache refresh failed: all states errored")
 
     @staticmethod
     def _station_to_dict(station) -> dict:
