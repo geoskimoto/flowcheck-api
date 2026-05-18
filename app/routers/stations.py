@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_db
+from app.schemas.forecast import ForecastResponse
 from app.schemas.station import StationSummary, StationDetail
+from app.services.forecast_service import get_forecast_service
 from app.services.streamflow_service import get_streamflow_service
 from app.services.water_year_service import get_water_year_stats
 
@@ -26,6 +28,17 @@ def water_year_stats(station_number: str, db: Session = Depends(get_db)):
             detail="Water year statistics unavailable — insufficient historical data or upstream API error",
         )
     return stats
+
+
+@router.get("/{station_number}/forecast", response_model=ForecastResponse)
+def station_forecast(station_number: str):
+    fc = get_forecast_service().get_forecast(station_number)
+    if fc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No NWRFC forecast available for this station",
+        )
+    return fc
 
 
 @router.get("/{station_number}", response_model=StationDetail)
