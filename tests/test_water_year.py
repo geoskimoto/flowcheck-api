@@ -66,8 +66,40 @@ class TestWaterYearEndpoint:
         assert isinstance(data, list)
         assert len(data) == 366
 
-    def test_endpoint_returns_503_when_unavailable(self, client):
+    def test_endpoint_returns_404_when_no_history(self, client):
+        # Empty result = definitive "insufficient historical data".
         with patch("app.routers.stations.get_water_year_stats") as mock_fn:
-            mock_fn.return_value = None
+            mock_fn.return_value = []
             resp = client.get("/stations/XXXXXXXX/water-year-stats")
+        assert resp.status_code == 404
+
+    def test_endpoint_returns_503_on_transient(self, client):
+        from app.services.water_year_service import WaterYearDataUnavailable
+        with patch("app.routers.stations.get_water_year_stats") as mock_fn:
+            mock_fn.side_effect = WaterYearDataUnavailable("reset")
+            resp = client.get("/stations/14211720/water-year-stats")
+        assert resp.status_code == 503
+
+
+class TestCurrentWaterYearEndpoint:
+    def test_returns_200_with_series(self, client):
+        series = [{"day_of_wy": 1, "discharge": 100.0}, {"day_of_wy": 2, "discharge": 110.0}]
+        with patch("app.routers.stations.get_current_water_year_series") as mock_fn:
+            mock_fn.return_value = series
+            resp = client.get("/stations/14211720/current-water-year")
+        assert resp.status_code == 200
+        assert resp.json() == series
+
+    def test_empty_series_is_200(self, client):
+        with patch("app.routers.stations.get_current_water_year_series") as mock_fn:
+            mock_fn.return_value = []
+            resp = client.get("/stations/14211720/current-water-year")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_transient_is_503(self, client):
+        from app.services.water_year_service import WaterYearDataUnavailable
+        with patch("app.routers.stations.get_current_water_year_series") as mock_fn:
+            mock_fn.side_effect = WaterYearDataUnavailable("reset")
+            resp = client.get("/stations/14211720/current-water-year")
         assert resp.status_code == 503
