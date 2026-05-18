@@ -2,6 +2,8 @@
 .env
 .env.test
 *.json
+# Bundled reference data (not a secret/credential) — must be tracked.
+!app/data/usgs_nwrfc_map.json
 
 # Python
 __pycache__/
