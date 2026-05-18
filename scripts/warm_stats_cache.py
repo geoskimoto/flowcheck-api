@@ -15,10 +15,15 @@ retried on the next run.
 import argparse
 import logging
 import sys
+from pathlib import Path
 
-from app.database import SessionLocal
-from app.services.streamflow_service import get_streamflow_service
-from app.services.water_year_service import (
+# Allow running as `./venv/bin/python scripts/warm_stats_cache.py` (Python
+# puts scripts/ on sys.path[0], not the repo root, so `app` isn't importable).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.database import SessionLocal  # noqa: E402
+from app.services.streamflow_service import get_streamflow_service  # noqa: E402
+from app.services.water_year_service import (  # noqa: E402
     WaterYearDataUnavailable,
     get_water_year_stats,
 )
