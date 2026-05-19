@@ -13,6 +13,7 @@ class StationSummary(BaseModel):
     percentile_rank: Optional[float] = None
     condition_band: Optional[str] = None
     condition_label: str = "Unknown"
+    has_forecast: bool = False
 
     model_config = {"from_attributes": True}
 

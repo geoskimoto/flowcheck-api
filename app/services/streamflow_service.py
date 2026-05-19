@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from app.config import get_settings
+from app.services.forecast_service import station_has_forecast
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,7 @@ class StreamflowService:
             "percentile_rank": pct.get("percentile_rank", None),
             "condition_band": pct.get("band", None),
             "condition_label": band_to_label(pct.get("band", "")),
+            "has_forecast": station_has_forecast(station["station_number"]),
         }
         if not detail:
             enriched.pop("huc_code", None)
