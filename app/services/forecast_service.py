@@ -29,6 +29,11 @@ def _usgs_nwrfc_map() -> dict[str, str]:
         return {}
 
 
+def station_has_forecast(station_number: str) -> bool:
+    """True if the station is in the bundled USGS->NWRFC map."""
+    return station_number in _usgs_nwrfc_map()
+
+
 class ForecastService:
     def __init__(self):
         settings = get_settings()
