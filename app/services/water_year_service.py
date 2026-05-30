@@ -105,6 +105,16 @@ def compute_water_year_stats(
     return stats.to_dict(orient="records")
 
 
+# In-flight request coalescing for water-year stats: multiple concurrent
+# requests for the same station's uncached stats are deduplicated to a
+# single upstream compute. The first request "owns" the compute; the
+# others wait, then read the result from the DB cache (Option B4).
+import threading  # noqa: E402
+
+_wy_inflight_lock = threading.Lock()
+_wy_inflight: dict[str, threading.Event] = {}
+
+
 def get_water_year_stats(station_number: str, db: Session) -> list[dict]:
     """
     Return cached water year stats, computing on cache miss.
@@ -116,23 +126,49 @@ def get_water_year_stats(station_number: str, db: Session) -> list[dict]:
     """
     current_wy = _current_water_year()
 
-    cached = db.query(WaterYearStatsCache).filter(
-        WaterYearStatsCache.station_number == station_number,
-        WaterYearStatsCache.water_year == current_wy,
-    ).first()
+    def _read_cache():
+        return db.query(WaterYearStatsCache).filter(
+            WaterYearStatsCache.station_number == station_number,
+            WaterYearStatsCache.water_year == current_wy,
+        ).first()
 
+    cached = _read_cache()
     if cached is not None:
         # stats_json may legitimately be [] (cached "insufficient history").
         logger.debug(f"Water year stats cache HIT: {station_number} WY{current_wy}")
         return cached.stats_json or []
 
+    # Coalesce concurrent identical cold computes.
+    with _wy_inflight_lock:
+        ev = _wy_inflight.get(station_number)
+        if ev is None:
+            ev = threading.Event()
+            _wy_inflight[station_number] = ev
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        # Wait for the owning request to finish (cap to avoid hanging).
+        ev.wait(timeout=180)
+        cached = _read_cache()
+        if cached is not None:
+            return cached.stats_json or []
+        # Owner failed transiently (cache empty); propagate same as miss.
+        raise WaterYearDataUnavailable("upstream failed during coalesced wait")
+
     logger.info(f"Water year stats cache MISS: computing {station_number} WY{current_wy}")
     # _fetch_and_compute raises WaterYearDataUnavailable on transient failure;
     # that propagates (uncached). A definitive [] IS cached so a no-data
     # station isn't re-fetched (30yr) on every view.
-    stats = _fetch_and_compute(station_number, current_wy)
-    _upsert_cache(db, station_number, current_wy, stats)
-    return stats
+    try:
+        stats = _fetch_and_compute(station_number, current_wy)
+        _upsert_cache(db, station_number, current_wy, stats)
+        return stats
+    finally:
+        with _wy_inflight_lock:
+            _wy_inflight.pop(station_number, None)
+        ev.set()
 
 
 def get_current_water_year_series(station_number: str) -> list[dict]:

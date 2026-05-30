@@ -67,3 +67,37 @@ app.include_router(devices.router)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/freshness")
+def freshness():
+    """Report the age of each internal cache so clients can show a
+    staleness banner when something upstream is lagging (Option B4)."""
+    import time
+    from app.database import SessionLocal
+    from app.models.water_year_stats_cache import WaterYearStatsCache
+    from app.services.streamflow_service import get_streamflow_service
+
+    svc = get_streamflow_service()
+    now = time.time()
+
+    def age(t: float):
+        return int(now - t) if t else None
+
+    db = SessionLocal()
+    try:
+        wy_n = db.query(WaterYearStatsCache).count()
+    except Exception:
+        wy_n = None
+    finally:
+        db.close()
+
+    return {
+        "stations_loaded": len(svc._station_cache),
+        "stations_age_s": age(svc._station_cache_time),
+        "last_observation_age_s": age(svc._last_obs_cache_time),
+        "percentile_bands_age_s": age(svc._percentile_cache_time),
+        "computed_percentile_age_s": age(svc._computed_pct_cache_time),
+        "computed_percentile_count": len(svc._computed_pct_cache),
+        "water_year_cache_stations": wy_n,
+    }
