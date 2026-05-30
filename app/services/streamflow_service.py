@@ -1,12 +1,61 @@
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from app.config import get_settings
 from app.services.forecast_service import station_has_forecast
 
 logger = logging.getLogger(__name__)
+
+_WY_START_MONTH = 10
+
+
+def _day_of_wy(d: datetime) -> int:
+    """Day-of-water-year (Oct 1 = 1). Mirrors water_year_service helpers."""
+    wy_start_year = d.year if d.month >= _WY_START_MONTH else d.year - 1
+    wy_start = datetime(wy_start_year, _WY_START_MONTH, 1)
+    return (d - wy_start).days + 1
+
+
+def _interp_pct(qs: tuple, x: float) -> Optional[float]:
+    """Estimate percentile rank from (q10, q25, q50, q75, q90) anchors."""
+    anchors = list(zip((10, 25, 50, 75, 90), qs))
+    if any(a is None for _, a in anchors):
+        return None
+    if x <= anchors[0][1]:
+        if anchors[0][1] <= 0:
+            return float(anchors[0][0])
+        return max(0.0, anchors[0][0] * (x / anchors[0][1]))
+    if x >= anchors[-1][1]:
+        a, b = anchors[-2], anchors[-1]
+        if b[1] == a[1]:
+            return float(b[0])
+        slope = (b[0] - a[0]) / (b[1] - a[1])
+        return min(99.9, b[0] + slope * (x - b[1]))
+    for i in range(len(anchors) - 1):
+        a, b = anchors[i], anchors[i + 1]
+        if a[1] <= x <= b[1]:
+            if b[1] == a[1]:
+                return float(a[0])
+            ratio = (x - a[1]) / (b[1] - a[1])
+            return a[0] + ratio * (b[0] - a[0])
+    return None
+
+
+def _pct_to_band(p: float) -> str:
+    """Map a percentile rank to StreamflowOps' band labels."""
+    cuts = (
+        (5, "p0_4"), (11, "p5_10"), (26, "p11_25"), (51, "p26_50"),
+        (76, "p51_75"), (86, "p76_85"), (91, "p86_90"), (96, "p91_95"),
+        (99, "p96_98"),
+    )
+    for thresh, band in cuts:
+        if p < thresh:
+            return band
+    return "p99_100"
 
 BAND_LABELS = {
     "p0_4": "Very Low",
@@ -52,6 +101,12 @@ class StreamflowService:
         # station_number -> ISO date string of last observation
         self._last_obs_cache: dict = {}
         self._last_obs_cache_time: float = 0.0
+        # station_number -> {percentile_rank, current_discharge, band}
+        # — computed by us from a bulk discharge fetch + the persistent
+        # water-year-stats cache (stable when StreamflowOps' percentile
+        # pipeline degrades).
+        self._computed_pct_cache: dict = {}
+        self._computed_pct_cache_time: float = 0.0
 
     def _stations_stale(self) -> bool:
         settings = get_settings()
@@ -62,6 +117,126 @@ class StreamflowService:
 
     def _last_obs_stale(self) -> bool:
         return (time.time() - self._last_obs_cache_time) > 3600  # 1 h
+
+    def _computed_pct_stale(self) -> bool:
+        return (time.time() - self._computed_pct_cache_time) > 1800  # 30 min
+
+    def _fetch_latest_discharge(self) -> dict:
+        """Bulk-fetch recent daily-mean observations across all stations,
+        return {station_number: latest discharge value}. ~1 upstream call
+        (+ pagination), much cheaper than 6k per-station fetches."""
+        end = datetime.now().date()
+        start = end - timedelta(days=5)
+        endpoint = "/api/v1/observations/discharge/"
+        params = {
+            "type": "daily_mean",
+            "start_date": str(start),
+            "end_date": str(end),
+            "limit": 1000,
+        }
+        latest: dict[str, tuple[str, float]] = {}
+        pages = 0
+        while endpoint and pages < 20:  # hard cap to bound work
+            try:
+                data = self._client._request("GET", endpoint, params=params)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"bulk discharge fetch failed: {e}")
+                break
+            for o in data.get("results", []):
+                sn = o.get("station_number")
+                d = o.get("discharge")
+                t = o.get("observed_at")
+                if not sn or d is None or t is None:
+                    continue
+                try:
+                    dv = float(d)
+                except (TypeError, ValueError):
+                    continue
+                prev = latest.get(sn)
+                if prev is None or t > prev[0]:
+                    latest[sn] = (t, dv)
+            nxt = data.get("next")
+            if not nxt:
+                break
+            parsed = urlparse(nxt)
+            endpoint = parsed.path
+            params = {
+                k: v[0] if len(v) == 1 else v
+                for k, v in parse_qs(parsed.query).items()
+            }
+            pages += 1
+        return {sn: v[1] for sn, v in latest.items()}
+
+    def _load_wy_cache(self) -> dict:
+        """station_number -> {day_of_wy(int): (q10,q25,q50,q75,q90)} for the
+        current water year. Loaded fresh whenever we recompute percentiles
+        (cheap — small table; grows as the warm script runs)."""
+        from app.database import SessionLocal
+        from app.models.water_year_stats_cache import WaterYearStatsCache
+        from app.services.water_year_service import _current_water_year
+        wy = _current_water_year()
+        out: dict[str, dict[int, tuple]] = {}
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(WaterYearStatsCache)
+                .filter(WaterYearStatsCache.water_year == wy)
+                .all()
+            )
+            for r in rows:
+                sj = r.stats_json or []
+                if not sj:
+                    continue
+                m: dict[int, tuple] = {}
+                for s in sj:
+                    dow = s.get("day_of_wy")
+                    if dow is None:
+                        continue
+                    m[int(dow)] = (
+                        s.get("q10"), s.get("q25"), s.get("q50"),
+                        s.get("q75"), s.get("q90"),
+                    )
+                if m:
+                    out[r.station_number] = m
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"WY cache load failed: {e}")
+        finally:
+            db.close()
+        return out
+
+    def _fetch_computed_percentiles(self) -> dict:
+        """Compute current percentile per station ourselves. Stable when the
+        upstream percentile-bands feed degrades; coverage grows with the
+        warm script. Hybrid: callers should prefer this map, falling back
+        to _fetch_percentiles for stations we can't compute."""
+        if not self._computed_pct_stale():
+            return self._computed_pct_cache
+        discharge = self._fetch_latest_discharge()
+        if not discharge:
+            return self._computed_pct_cache
+        wy = self._load_wy_cache()
+        today_dowy = _day_of_wy(datetime.now())
+        out: dict[str, dict] = {}
+        for sn, x in discharge.items():
+            stats = wy.get(sn)
+            if not stats:
+                continue
+            qs = stats.get(today_dowy) or stats[
+                min(stats, key=lambda k: abs(k - today_dowy))
+            ]
+            pct = _interp_pct(qs, x)
+            if pct is None:
+                continue
+            out[sn] = {
+                "percentile_rank": round(pct, 2),
+                "current_discharge": x,
+                "band": _pct_to_band(pct),
+            }
+        # last-good fallback: only swap in if we computed something
+        if out:
+            self._computed_pct_cache = out
+            self._computed_pct_cache_time = time.time()
+        return self._computed_pct_cache
 
     def _fetch_last_obs(self) -> dict:
         # /stations/last-observation/ is the most stable freshness signal
@@ -112,7 +287,11 @@ class StreamflowService:
             stations = [s for s in stations if s.get("state") == state.upper()]
         percentiles = self._fetch_percentiles()
         last_obs = self._fetch_last_obs()
-        return [self._enrich(s, percentiles, last_obs=last_obs) for s in stations]
+        computed = self._fetch_computed_percentiles()
+        return [
+            self._enrich(s, percentiles, last_obs=last_obs, computed=computed)
+            for s in stations
+        ]
 
     def get_station(self, station_number: str) -> Optional[dict]:
         # Serve detail from the station cache (it already holds full per-
@@ -124,13 +303,16 @@ class StreamflowService:
             self._refresh_station_cache()
         percentiles = self._fetch_percentiles()
         last_obs = self._fetch_last_obs()
+        computed = self._fetch_computed_percentiles()
         for s in self._station_cache:
             if s.get("station_number") == station_number:
-                return self._enrich(s, percentiles, detail=True, last_obs=last_obs)
+                return self._enrich(s, percentiles, detail=True,
+                                    last_obs=last_obs, computed=computed)
         try:
             raw = self._client.get_station(station_number)
             station_dict = self._station_to_dict(raw)
-            return self._enrich(station_dict, percentiles, detail=True, last_obs=last_obs)
+            return self._enrich(station_dict, percentiles, detail=True,
+                                last_obs=last_obs, computed=computed)
         except Exception as e:
             logger.warning(f"get_station {station_number} failed: {e}")
             return None
@@ -209,8 +391,13 @@ class StreamflowService:
         percentiles: dict,
         detail: bool = False,
         last_obs: Optional[dict] = None,
+        computed: Optional[dict] = None,
     ) -> dict:
-        pct = percentiles.get(station["station_number"], {})
+        # Hybrid: prefer our own computed percentile when available
+        # (stable against StreamflowOps' brittle percentile-bands feed),
+        # fall back to the upstream snapshot otherwise.
+        sn = station["station_number"]
+        pct = (computed or {}).get(sn) or percentiles.get(sn, {})
         enriched = {
             **station,
             "current_discharge_cfs": pct.get("current_discharge", None),
