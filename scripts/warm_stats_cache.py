@@ -4,71 +4,45 @@ are instant DB hits instead of slow/flaky cold computes.
 
 Run from the repo root with the venv (loads .env via app.config):
 
-    ./venv/bin/python scripts/warm_stats_cache.py            # all cached stations
+    ./venv/bin/python scripts/warm_stats_cache.py            # all stations
     ./venv/bin/python scripts/warm_stats_cache.py --limit 50 # first 50 (smoke test)
     ./venv/bin/python scripts/warm_stats_cache.py --state OR  # one state
 
 Idempotent: stations already cached for the current water year are skipped
 fast (cache HIT). Transiently-failed stations are left uncached and will be
-retried on the next run.
+retried on the next run. Same logic also runs nightly inside the API via
+app/scheduler/cache_warmer.run_cache_warm (Option B2).
 """
 import argparse
 import logging
 import sys
 from pathlib import Path
 
-# Allow running as `./venv/bin/python scripts/warm_stats_cache.py` (Python
-# puts scripts/ on sys.path[0], not the repo root, so `app` isn't importable).
+# Allow running as `./venv/bin/python scripts/warm_stats_cache.py` — Python
+# puts scripts/ on sys.path[0], not the repo root, so `app` isn't importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.database import SessionLocal  # noqa: E402
-from app.services.streamflow_service import get_streamflow_service  # noqa: E402
-from app.services.water_year_service import (  # noqa: E402
-    WaterYearDataUnavailable,
-    get_water_year_stats,
-)
-
-logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-log = logging.getLogger("warm_stats_cache")
+from app.scheduler.cache_warmer import warm_water_year_cache  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="cap number of stations")
     ap.add_argument("--state", default=None, help="restrict to one state (e.g. OR)")
+    ap.add_argument("--max-seconds", type=int, default=0,
+                    help="stop after this many seconds (0 = no cap)")
+    ap.add_argument("--prefer-recent-days", type=int, default=14,
+                    help="warm recently-reporting stations first")
     args = ap.parse_args()
 
-    svc = get_streamflow_service()
-    stations = svc.list_stations(state=args.state)
-    nums = [s["station_number"] for s in stations]
-    if args.limit:
-        nums = nums[: args.limit]
-
-    total = len(nums)
-    ok = empty = transient = 0
-    print(f"Warming {total} stations (state={args.state or 'ALL'})...")
-
-    db = SessionLocal()
-    try:
-        for i, sn in enumerate(nums, 1):
-            try:
-                stats = get_water_year_stats(sn, db)
-                if stats:
-                    ok += 1
-                else:
-                    empty += 1  # cached "insufficient history"
-            except WaterYearDataUnavailable:
-                transient += 1  # left uncached; retry on a later run
-            except Exception as e:  # noqa: BLE001
-                transient += 1
-                log.warning(f"{sn}: {e}")
-            if i % 25 == 0 or i == total:
-                print(f"  {i}/{total}  ok={ok} no-data={empty} transient={transient}")
-    finally:
-        db.close()
-
-    print(f"Done. cached-with-data={ok} cached-no-data={empty} "
-          f"transient-skipped={transient}")
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    result = warm_water_year_cache(
+        state=args.state,
+        limit=args.limit or None,
+        max_seconds=args.max_seconds or None,
+        prefer_recent_days=args.prefer_recent_days,
+    )
+    print(result)
     return 0
 
 
