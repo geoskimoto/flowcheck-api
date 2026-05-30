@@ -107,6 +107,164 @@ class StreamflowService:
         # pipeline degrades).
         self._computed_pct_cache: dict = {}
         self._computed_pct_cache_time: float = 0.0
+        # Boot-strap caches from Postgres so an API restart doesn't need
+        # a successful upstream call to serve the map (Option B3).
+        self._load_caches_from_db()
+
+    def _load_caches_from_db(self) -> None:
+        try:
+            from app.database import SessionLocal
+            from app.models.station_cache import StationCache
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"station_cache import failed: {e}")
+            return
+        db = SessionLocal()
+        try:
+            # Filter out any orphan rows that lack metadata (defensive — a
+            # buggy persist could leave name='' rows that would then 500
+            # the response via the StationSummary state-is-str validator).
+            rows = (
+                db.query(StationCache)
+                .filter(StationCache.name != "")
+                .all()
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"load stations_cache from DB failed: {e}")
+            db.close()
+            return
+        try:
+            self._station_cache = [
+                {
+                    "station_number": r.station_number,
+                    "name": r.name or "",
+                    "state": r.state,
+                    "latitude": r.latitude,
+                    "longitude": r.longitude,
+                    "is_active": bool(r.is_active),
+                    "huc_code": r.huc_code,
+                    "basin": r.basin,
+                    "years_of_record": r.years_of_record,
+                    "record_start_date": r.record_start_date or "",
+                }
+                for r in rows
+            ]
+            if self._station_cache:
+                # Treat DB-loaded data as fresh enough to serve; TTL still
+                # drives the next upstream refresh.
+                self._station_cache_time = time.time()
+            self._last_obs_cache = {
+                r.station_number: r.last_observation_date
+                for r in rows
+                if r.last_observation_date
+            }
+            if self._last_obs_cache:
+                self._last_obs_cache_time = time.time()
+            logger.info(
+                f"Loaded {len(self._station_cache)} stations "
+                f"({len(self._last_obs_cache)} with last_observation_date) "
+                f"from DB"
+            )
+        finally:
+            db.close()
+
+    def _persist_station_cache(self, stations: list[dict]) -> None:
+        """Upsert station metadata. Leaves last_observation_date untouched
+        so the separate last-obs refresh manages that column."""
+        if not stations:
+            return
+        try:
+            from datetime import datetime, timezone
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+            from app.database import SessionLocal
+            from app.models.station_cache import StationCache
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"persist stations import failed: {e}")
+            return
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "station_number": s["station_number"],
+                "name": s.get("name") or "",
+                "state": s.get("state"),
+                "latitude": s.get("latitude"),
+                "longitude": s.get("longitude"),
+                "is_active": bool(s.get("is_active", True)),
+                "huc_code": s.get("huc_code"),
+                "basin": s.get("basin"),
+                "years_of_record": s.get("years_of_record"),
+                "record_start_date": s.get("record_start_date") or None,
+                "refreshed_at": now,
+            }
+            for s in stations
+            if s.get("station_number")
+        ]
+        if not rows:
+            return
+        db = SessionLocal()
+        try:
+            stmt = pg_insert(StationCache).values(rows)
+            update_cols = {
+                c: stmt.excluded[c]
+                for c in (
+                    "name", "state", "latitude", "longitude", "is_active",
+                    "huc_code", "basin", "years_of_record",
+                    "record_start_date", "refreshed_at",
+                )
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["station_number"], set_=update_cols
+            )
+            db.execute(stmt)
+            db.commit()
+            logger.info(f"Persisted {len(rows)} stations to DB")
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            logger.warning(f"persist stations failed: {e}")
+        finally:
+            db.close()
+
+    def _persist_last_obs(self, latest: dict) -> None:
+        """Update the last_observation_date column for stations we cover.
+
+        Only updates existing rows — orphan stations from upstream's much
+        larger last-observation feed (e.g. Canadian / out-of-region) would
+        otherwise pollute the table with rows that have no metadata.
+        """
+        if not latest or not self._station_cache:
+            return
+        try:
+            from datetime import datetime, timezone
+            from sqlalchemy import text
+            from app.database import SessionLocal
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"persist last_obs import failed: {e}")
+            return
+        covered = {s.get("station_number") for s in self._station_cache}
+        now = datetime.now(timezone.utc)
+        rows = [
+            {"sn": sn, "lod": d, "ra": now}
+            for sn, d in latest.items()
+            if sn in covered
+        ]
+        if not rows:
+            return
+        db = SessionLocal()
+        try:
+            stmt = text(
+                "UPDATE stations_cache "
+                "SET last_observation_date = :lod, refreshed_at = :ra "
+                "WHERE station_number = :sn"
+            )
+            db.execute(stmt, rows)
+            db.commit()
+            logger.info(
+                f"Persisted last_observation_date for {len(rows)} stations"
+            )
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            logger.warning(f"persist last_obs failed: {e}")
+        finally:
+            db.close()
 
     def _stations_stale(self) -> bool:
         settings = get_settings()
@@ -257,6 +415,7 @@ class StreamflowService:
             if new_map:
                 self._last_obs_cache = new_map
                 self._last_obs_cache_time = time.time()
+                self._persist_last_obs(new_map)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"last-observation fetch failed: {e}")
         return self._last_obs_cache
@@ -365,6 +524,7 @@ class StreamflowService:
         if any_success:
             self._station_cache = all_stations
             self._station_cache_time = time.time()
+            self._persist_station_cache(all_stations)
         else:
             logger.error("Station cache refresh failed: all states errored")
 
