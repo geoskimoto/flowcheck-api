@@ -49,6 +49,9 @@ class StreamflowService:
         self._station_cache_time: float = 0.0
         self._percentile_cache: dict = {}
         self._percentile_cache_time: float = 0.0
+        # station_number -> ISO date string of last observation
+        self._last_obs_cache: dict = {}
+        self._last_obs_cache_time: float = 0.0
 
     def _stations_stale(self) -> bool:
         settings = get_settings()
@@ -56,6 +59,32 @@ class StreamflowService:
 
     def _percentiles_stale(self) -> bool:
         return (time.time() - self._percentile_cache_time) > 1800  # 30 min
+
+    def _last_obs_stale(self) -> bool:
+        return (time.time() - self._last_obs_cache_time) > 3600  # 1 h
+
+    def _fetch_last_obs(self) -> dict:
+        # /stations/last-observation/ is the most stable freshness signal
+        # StreamflowOps exposes (~10k stations). On upstream failure keep
+        # the last good cache so the map never blanks.
+        if not self._last_obs_stale():
+            return self._last_obs_cache
+        try:
+            resp = self._client._request(
+                "GET", "/api/v1/stations/last-observation/", params={}
+            )
+            rows = resp if isinstance(resp, list) else resp.get("results", [])
+            new_map = {
+                r["station_number"]: r.get("last_observation_date")
+                for r in rows
+                if r.get("station_number")
+            }
+            if new_map:
+                self._last_obs_cache = new_map
+                self._last_obs_cache_time = time.time()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"last-observation fetch failed: {e}")
+        return self._last_obs_cache
 
     def _fetch_percentiles(self) -> dict:
         if not self._percentiles_stale():
@@ -82,7 +111,8 @@ class StreamflowService:
         if state:
             stations = [s for s in stations if s.get("state") == state.upper()]
         percentiles = self._fetch_percentiles()
-        return [self._enrich(s, percentiles) for s in stations]
+        last_obs = self._fetch_last_obs()
+        return [self._enrich(s, percentiles, last_obs=last_obs) for s in stations]
 
     def get_station(self, station_number: str) -> Optional[dict]:
         # Serve detail from the station cache (it already holds full per-
@@ -93,13 +123,14 @@ class StreamflowService:
         if self._stations_stale():
             self._refresh_station_cache()
         percentiles = self._fetch_percentiles()
+        last_obs = self._fetch_last_obs()
         for s in self._station_cache:
             if s.get("station_number") == station_number:
-                return self._enrich(s, percentiles, detail=True)
+                return self._enrich(s, percentiles, detail=True, last_obs=last_obs)
         try:
             raw = self._client.get_station(station_number)
             station_dict = self._station_to_dict(raw)
-            return self._enrich(station_dict, percentiles, detail=True)
+            return self._enrich(station_dict, percentiles, detail=True, last_obs=last_obs)
         except Exception as e:
             logger.warning(f"get_station {station_number} failed: {e}")
             return None
@@ -173,7 +204,12 @@ class StreamflowService:
         }
 
     @staticmethod
-    def _enrich(station: dict, percentiles: dict, detail: bool = False) -> dict:
+    def _enrich(
+        station: dict,
+        percentiles: dict,
+        detail: bool = False,
+        last_obs: Optional[dict] = None,
+    ) -> dict:
         pct = percentiles.get(station["station_number"], {})
         enriched = {
             **station,
@@ -182,6 +218,8 @@ class StreamflowService:
             "condition_band": pct.get("band", None),
             "condition_label": band_to_label(pct.get("band", "")),
             "has_forecast": station_has_forecast(station["station_number"]),
+            "last_observation_date":
+                (last_obs or {}).get(station["station_number"]),
         }
         if not detail:
             enriched.pop("huc_code", None)
