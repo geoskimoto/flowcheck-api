@@ -14,6 +14,7 @@ class StationSummary(BaseModel):
     condition_band: Optional[str] = None
     condition_label: str = "Unknown"
     has_forecast: bool = False
+    last_observation_date: Optional[str] = None  # ISO date
 
     model_config = {"from_attributes": True}
 
